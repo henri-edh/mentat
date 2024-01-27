@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 import asyncio
+import multiprocessing
 import os
 from functools import partial
-from multiprocessing import Pool
 from pathlib import Path
 
 import tqdm
@@ -190,14 +190,15 @@ def run_exercism_benchmark(
 ):
     all_exercises = os.listdir("exercises/practice")
     if len(benchmarks) > 0:
-        exercises = set(benchmarks) & set(all_exercises)
+        exercises = list(set(benchmarks) & set(all_exercises))
     else:
         exercises = all_exercises[:max_benchmarks]
+    exercises = sorted(exercises)
     num_exercises = len(exercises)
 
     # TODO: aiomultiprocessing would be faster with fewer workers; setup a Manager in a parent process
     # that controls the children processes so that we don't run into rate limits
-    with Pool(processes=max_workers) as pool:
+    with multiprocessing.Pool(processes=max_workers) as pool:
         pbar = tqdm.tqdm(total=num_exercises)
 
         result_map = pool.imap(
@@ -223,8 +224,9 @@ if __name__ == "__main__":
     parser = common_benchmark_parser()
     args = parser.parse_args()
     clone_exercism_repo(args.refresh_repo, args.language)
+    print(args)
     run_exercism_benchmark(
-        args.benchmarks[0],
+        args.benchmarks,
         args.max_benchmarks,
         args.max_iterations,
         args.max_workers,
