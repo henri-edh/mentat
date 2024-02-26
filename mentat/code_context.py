@@ -17,7 +17,6 @@ from mentat.diff_context import DiffContext
 from mentat.errors import PathValidationError
 from mentat.feature_filters.default_filter import DefaultFilter
 from mentat.feature_filters.embedding_similarity_filter import EmbeddingSimilarityFilter
-from mentat.git_handler import get_paths_with_git_diffs
 from mentat.include_files import (
     PathType,
     get_code_features_for_path,
@@ -45,6 +44,7 @@ class ContextStreamMessage(TypedDict):
     features: List[str]
     auto_features: List[str]
     git_diff_paths: List[str]
+    git_untracked_paths: List[str]
     total_tokens: int
     total_cost: float
 
@@ -53,21 +53,16 @@ class CodeContext:
     def __init__(
         self,
         stream: SessionStream,
-        git_root: Optional[Path] = None,
+        cwd: Path,
         diff: Optional[str] = None,
         pr_diff: Optional[str] = None,
         ignore_patterns: Iterable[Path | str] = [],
     ):
-        self.git_root = git_root
         self.diff = diff
         self.pr_diff = pr_diff
         self.ignore_patterns = set(Path(p) for p in ignore_patterns)
 
-        self.diff_context = None
-        if self.git_root:
-            self.diff_context = DiffContext(
-                stream, self.git_root, self.diff, self.pr_diff
-            )
+        self.diff_context = DiffContext(stream, cwd, self.diff, self.pr_diff)
 
         self.include_files: Dict[Path, List[CodeFeature]] = {}
         self.ignore_files: Set[Path] = set()
@@ -75,14 +70,11 @@ class CodeContext:
 
     def refresh_context_display(self):
         """
-        Sends a message to the client with the new updated code context
-        Must be called whenever the context changes!
+        Sends a message to the client with the code context. It is called in the main loop.
         """
         ctx = SESSION_CONTEXT.get()
 
-        diff_context_display = None
-        if self.diff_context and self.diff_context.name:
-            diff_context_display = self.diff_context.get_display_context()
+        diff_context_display = self.diff_context.get_display_context()
 
         features = get_consolidated_feature_refs(
             [
@@ -92,9 +84,8 @@ class CodeContext:
             ]
         )
         auto_features = get_consolidated_feature_refs(self.auto_features)
-        git_diff_paths = (
-            list(get_paths_with_git_diffs(self.git_root)) if self.git_root else []
-        )
+        git_diff_paths = [str(p) for p in self.diff_context.diff_files()]
+        git_untracked_paths = [str(p) for p in self.diff_context.untracked_files()]
 
         messages = ctx.conversation.get_messages()
         code_message = get_code_message_from_features(
@@ -123,7 +114,8 @@ class CodeContext:
             auto_context_tokens=ctx.config.auto_context_tokens,
             features=features,
             auto_features=auto_features,
-            git_diff_paths=[str(p) for p in git_diff_paths],
+            git_diff_paths=git_diff_paths,
+            git_untracked_paths=git_untracked_paths,
             total_tokens=total_tokens,
             total_cost=total_cost,
         )
@@ -149,17 +141,17 @@ class CodeContext:
 
         # Setup code message metadata
         code_message = list[str]()
-        if self.diff_context:
-            # Since there is no way of knowing when the git diff changes,
-            # we just refresh the cache every time get_code_message is called
-            self.diff_context.refresh_diff_files()
-            if self.diff_context.diff_files():
-                code_message += [
-                    "Diff References:",
-                    f' "-" = {self.diff_context.name}',
-                    ' "+" = Active Changes',
-                    "",
-                ]
+
+        # Since there is no way of knowing when the git diff changes,
+        # we just refresh the cache every time get_code_message is called
+        self.diff_context.refresh()
+        if self.diff_context.diff_files():
+            code_message += [
+                "Diff References:",
+                f' "-" = {self.diff_context.name}',
+                ' "+" = Active Changes',
+                "",
+            ]
 
         code_message += ["Code Files:\n"]
         meta_tokens = count_tokens("\n".join(code_message), model, full_message=True)
@@ -194,7 +186,6 @@ class CodeContext:
             self.auto_features = list(
                 set(self.auto_features) | set(await feature_filter.filter(features))
             )
-            self.refresh_context_display()
 
         # Merge include file features and auto features and add to code message
         code_message += get_code_message_from_features(
@@ -244,7 +235,6 @@ class CodeContext:
         Clears all auto-features added to the conversation so far.
         """
         self._auto_features = []
-        self.refresh_context_display()
 
     def include_features(self, code_features: Iterable[CodeFeature]):
         """
@@ -272,7 +262,6 @@ class CodeContext:
                         self.include_files[code_feature.path] = []
                     self.include_files[code_feature.path].append(code_feature)
                     included_paths.add(Path(str(code_feature)))
-        self.refresh_context_display()
         return included_paths
 
     def include(
@@ -428,7 +417,6 @@ class CodeContext:
         except PathValidationError as e:
             session_context.stream.send(str(e), style="error")
 
-        self.refresh_context_display()
         return excluded_paths
 
     async def search(
